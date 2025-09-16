@@ -14,6 +14,7 @@ import logging
 import torch
 import gc
 import os
+import copy
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass, asdict
@@ -24,6 +25,21 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoConfig
 from huggingface_hub import snapshot_download, hf_hub_download
 import shutil
+
+# Optional imports with error handling
+try:
+    import jsonlines
+    JSONLINES_AVAILABLE = True
+except ImportError:
+    JSONLINES_AVAILABLE = False
+    logging.warning("jsonlines library not available. JSONL format support will be limited.")
+
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+    logging.warning("pandas library not available. CSV/Parquet format support will be limited.")
 
 
 class QuantizationMethod(Enum):
@@ -272,7 +288,8 @@ class RecipeManager:
         Returns:
             Adapted recipe
         """
-        adapted_recipe = recipe.copy()
+        import copy
+        adapted_recipe = copy.deepcopy(recipe)  # Use deep copy to avoid mutation
         
         # Get the quantization config (awq or gptq)
         quant_method = recipe.get("quant_method", "awq")
@@ -283,7 +300,7 @@ class RecipeManager:
             
             # Estimate memory requirements
             base_model_size_gb = 24  # GLM-4.5-Air approximate size
-            bits = config.get("bits", 4)
+            bits = config.get("bits", 4) if isinstance(config, dict) else 4
             quantized_size_gb = base_model_size_gb * (bits / 16)  # Rough estimate
             
             # Adjust based on available memory
@@ -302,7 +319,7 @@ class RecipeManager:
                 
                 # For very limited memory, reduce group size
                 if available_memory_gb < 16:
-                    config["group_size"] = max(
+                    config["group_size"] = min(
                         config.get("group_size", 128),
                         64
                     )
@@ -322,7 +339,7 @@ class RecipeManager:
         self.logger.info(f"Adapted recipe for {available_memory_gb}GB GPU memory")
         return adapted_recipe
     
-    def save_recipe(self, recipe: Dict[str, Any], name: str) -> Path:
+    def save_recipe(self, recipe: Dict[str, Any], name: str) -> Optional[Path]:
         """
         Save recipe to YAML file.
         
@@ -331,7 +348,7 @@ class RecipeManager:
             name: Name for the recipe file
             
         Returns:
-            Path to saved recipe file
+            Path to saved recipe file, or None if save failed
         """
         # Ensure name has .yaml extension
         if not name.endswith('.yaml'):
@@ -340,15 +357,23 @@ class RecipeManager:
         recipe_path = self.recipe_dir / name
         
         try:
+            # Ensure directory exists
+            recipe_path.parent.mkdir(parents=True, exist_ok=True)
+            
             with open(recipe_path, 'w') as f:
                 yaml.dump(recipe, f, default_flow_style=False, sort_keys=False)
             
-            self.logger.info(f"Saved recipe to {recipe_path}")
-            return recipe_path
-            
+            # Verify file was created
+            if recipe_path.exists():
+                self.logger.info(f"Saved recipe to {recipe_path}")
+                return recipe_path
+            else:
+                self.logger.error(f"Recipe file was not created at {recipe_path}")
+                return None
+                
         except Exception as e:
             self.logger.error(f"Error saving recipe: {e}")
-            raise
+            return None
     
     def get_glm_layer_patterns(self) -> Dict[str, List[str]]:
         """
@@ -428,14 +453,18 @@ class DatasetPreparer:
             dataset = load_dataset(
                 "garage-bAInd/Open-Platypus",
                 split="train",
-                cache_dir=str(self.cache_dir)
+                cache_dir=str(self.cache_dir),
+                streaming=False  # Load fully for proper shuffling
             )
             
-            # Shuffle and select samples
+            # Shuffle and select samples BEFORE converting to list
             dataset = dataset.shuffle(seed=42)
             
+            # Select subset efficiently
             if len(dataset) > num_samples:
                 dataset = dataset.select(range(num_samples))
+            
+            self.logger.info(f"Selected {len(dataset)} samples from Open Platypus")
             
             self.logger.info(f"Loaded {len(dataset)} samples from Open Platypus")
             
@@ -443,8 +472,26 @@ class DatasetPreparer:
             processed_data = []
             for item in dataset:
                 # Open Platypus has 'instruction' and 'output' fields
-                text = f"Instruction: {item['instruction']}\n\nResponse: {item['output']}"
-                processed_data.append({"text": text})
+                # Check if fields exist before accessing
+                try:
+                    if 'instruction' in item and 'output' in item:
+                        text = f"Instruction: {item['instruction']}\n\nResponse: {item['output']}"
+                    elif 'text' in item:
+                        text = item['text']
+                    else:
+                        # Try to use any available text field
+                        text = str(item.get('content', item.get('input', str(item))))
+                    processed_data.append({"text": text})
+                except (KeyError, TypeError) as e:
+                    self.logger.warning(f"Error processing dataset item: {e}")
+                    # Skip problematic items
+                    continue
+            
+            # Check if we got any valid data
+            if not processed_data:
+                self.logger.error("No valid data extracted from Open Platypus dataset")
+                self.logger.info("Falling back to WikiText-2 dataset")
+                return self.load_wikitext_fallback(num_samples)
             
             return processed_data
             
@@ -544,7 +591,9 @@ class DatasetPreparer:
         """
         try:
             if format_type == "jsonl":
-                import jsonlines
+                if not JSONLINES_AVAILABLE:
+                    raise ImportError("jsonlines library is required for JSONL format. Install with: pip install jsonlines")
+                
                 samples = []
                 with jsonlines.open(dataset_path) as reader:
                     for i, obj in enumerate(reader):
@@ -559,7 +608,9 @@ class DatasetPreparer:
                 return samples
                 
             elif format_type == "csv":
-                import pandas as pd
+                if not PANDAS_AVAILABLE:
+                    raise ImportError("pandas library is required for CSV format. Install with: pip install pandas")
+                
                 df = pd.read_csv(dataset_path, nrows=num_samples)
                 
                 # Try to find text column
@@ -579,7 +630,9 @@ class DatasetPreparer:
                 return samples
                 
             elif format_type == "parquet":
-                import pandas as pd
+                if not PANDAS_AVAILABLE:
+                    raise ImportError("pandas library is required for Parquet format. Install with: pip install pandas pyarrow")
+                
                 df = pd.read_parquet(dataset_path)
                 if len(df) > num_samples:
                     df = df.sample(n=num_samples, random_state=42)
@@ -602,6 +655,9 @@ class DatasetPreparer:
             else:
                 raise ValueError(f"Unsupported format type: {format_type}")
                 
+        except ImportError as e:
+            self.logger.error(f"Missing required library: {e}")
+            raise
         except Exception as e:
             self.logger.error(f"Error loading custom dataset: {e}")
             raise
@@ -772,7 +828,7 @@ class DatasetPreparer:
                     "attention_mask": tokens["attention_mask"].squeeze()
                 }
                 
-                # Add token type IDs if the model uses them
+                # Add token type IDs if the model uses them (check if they exist)
                 if "token_type_ids" in tokens:
                     processed_sample["token_type_ids"] = tokens["token_type_ids"].squeeze()
                 
@@ -794,7 +850,8 @@ class DatasetPreparer:
                     "attention_mask": [s["attention_mask"].tolist() for s in processed_samples]
                 }
                 
-                if "token_type_ids" in processed_samples[0]:
+                # Only add token_type_ids if they exist in processed samples
+                if processed_samples[0].get("token_type_ids") is not None:
                     dataset_dict["token_type_ids"] = [s["token_type_ids"].tolist() for s in processed_samples]
                 
                 return Dataset.from_dict(dataset_dict)
@@ -917,28 +974,44 @@ class ModelDownloader:
             model_name = model_id.replace("/", "_")
             local_path = self.cache_dir / model_name
             
-            # Check if already downloaded
-            if local_path.exists() and self.verify_model_integrity(local_path):
-                self.logger.info(f"Model already downloaded at {local_path}")
-                return local_path
+            # Check if already downloaded and valid
+            if local_path.exists():
+                if self.verify_model_integrity(local_path):
+                    self.logger.info(f"Model already downloaded and verified at {local_path}")
+                    return local_path
+                else:
+                    self.logger.warning(f"Existing model at {local_path} failed integrity check, re-downloading...")
+                    # Could optionally delete the corrupted model here
+                    # shutil.rmtree(local_path, ignore_errors=True)
             
             # Download using snapshot_download for full model
             self.logger.info("Starting model download (this may take a while)...")
             
-            # Set environment variable for HF cache
-            os.environ['HF_HOME'] = str(self.cache_dir)
+            # Store current HF_HOME if it exists
+            original_hf_home = os.environ.get('HF_HOME')
             
-            downloaded_path = snapshot_download(
-                repo_id=model_id,
-                revision=revision,
-                cache_dir=str(self.cache_dir),
-                local_dir=str(local_path),
-                local_dir_use_symlinks=False,
-                resume_download=True,
-                ignore_patterns=["*.md", "*.txt", "LICENSE"]
-            )
-            
-            self.logger.info(f"Model downloaded to {local_path}")
+            try:
+                # Set environment variable for HF cache
+                os.environ['HF_HOME'] = str(self.cache_dir)
+                
+                downloaded_path = snapshot_download(
+                    repo_id=model_id,
+                    revision=revision,
+                    cache_dir=str(self.cache_dir),
+                    local_dir=str(local_path),
+                    local_dir_use_symlinks=False,
+                    resume_download=True,
+                    ignore_patterns=["*.md", "*.txt", "LICENSE"]
+                )
+                
+                self.logger.info(f"Model downloaded to {local_path}")
+                
+            finally:
+                # Always restore original HF_HOME
+                if original_hf_home is not None:
+                    os.environ['HF_HOME'] = original_hf_home
+                elif 'HF_HOME' in os.environ:
+                    del os.environ['HF_HOME']
             
             # Verify download
             if not self.verify_model_integrity(local_path):
@@ -975,7 +1048,17 @@ class ModelDownloader:
             
             # Set padding token if not present
             if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
+                if tokenizer.eos_token is not None:
+                    tokenizer.pad_token = tokenizer.eos_token
+                else:
+                    # Try to use other special tokens as fallback
+                    if hasattr(tokenizer, 'unk_token') and tokenizer.unk_token is not None:
+                        tokenizer.pad_token = tokenizer.unk_token
+                        self.logger.warning("Using unk_token as pad_token")
+                    else:
+                        # As last resort, add a new pad token
+                        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                        self.logger.warning("Added new [PAD] token as pad_token")
             
             self.logger.info(f"Tokenizer loaded successfully")
             return tokenizer
@@ -1171,12 +1254,19 @@ class ModelDownloader:
             # Total
             total_params = embedding_params + layers * (attention_params + mlp_params)
             info["estimated_parameters"] = total_params
-            info["estimated_parameters_billions"] = total_params / 1e9
             
-            # Model size estimation
-            bytes_per_param = 2  # Assuming fp16
-            model_size_bytes = total_params * bytes_per_param
-            info["estimated_size_gb"] = model_size_bytes / (1024 ** 3)
+            # Safe division for billions calculation
+            if total_params > 0:
+                info["estimated_parameters_billions"] = total_params / 1e9
+                
+                # Model size estimation
+                bytes_per_param = 2  # Assuming fp16
+                model_size_bytes = total_params * bytes_per_param
+                info["estimated_size_gb"] = model_size_bytes / (1024 ** 3)
+            else:
+                info["estimated_parameters_billions"] = 0
+                info["estimated_size_gb"] = 0
+                self.logger.warning("Model parameter count is 0 - config may be invalid")
             
             self.logger.info(f"Model info extracted: {info['model_type']} with "
                            f"{info['estimated_parameters_billions']:.1f}B parameters")
@@ -1281,16 +1371,20 @@ class PreparationValidator:
         """Initialize preparation validator."""
         self.logger = logging.getLogger(__name__)
         
-    def validate_recipe_ready(self, recipe_path: Path) -> bool:
+    def validate_recipe_ready(self, recipe_path: Optional[Path]) -> bool:
         """
         Validate recipe is ready for use.
         
         Args:
-            recipe_path: Path to recipe file
+            recipe_path: Path to recipe file (can be None)
             
         Returns:
             True if recipe is ready
         """
+        if recipe_path is None:
+            self.logger.error("Recipe path is None")
+            return False
+            
         if not recipe_path.exists():
             self.logger.error(f"Recipe file not found: {recipe_path}")
             return False
@@ -1333,17 +1427,44 @@ class PreparationValidator:
             return False
         
         try:
-            # Check if we can iterate
-            sample = next(iter(dataset))
+            # Handle different dataset types
+            first_sample = None
+            dataset_size = 0
             
-            # Check for required fields
-            if not isinstance(sample, dict) or "text" not in sample:
-                self.logger.error("Dataset samples must be dictionaries with 'text' field")
+            # For HuggingFace Dataset objects
+            if hasattr(dataset, '__len__') and hasattr(dataset, '__getitem__'):
+                dataset_size = len(dataset)
+                if dataset_size > 0:
+                    first_sample = dataset[0]
+            else:
+                # For generators or iterables
+                try:
+                    # Try to get first sample and count
+                    for i, sample in enumerate(dataset):
+                        if i == 0:
+                            first_sample = sample
+                        dataset_size += 1
+                        
+                        # Don't iterate through entire large datasets
+                        if i >= 1000:
+                            dataset_size = ">1000"
+                            break
+                except TypeError:
+                    # Not iterable
+                    self.logger.error("Dataset is not iterable")
+                    return False
+            
+            # Validate first sample structure
+            if first_sample is not None:
+                if not isinstance(first_sample, dict) or "text" not in first_sample:
+                    self.logger.error("Dataset samples must be dictionaries with 'text' field")
+                    return False
+            else:
+                self.logger.error("Could not retrieve first sample from dataset")
                 return False
             
             # Check minimum size
-            dataset_size = len(dataset) if hasattr(dataset, '__len__') else sum(1 for _ in dataset)
-            if dataset_size < 10:
+            if isinstance(dataset_size, int) and dataset_size < 10:
                 self.logger.warning(f"Dataset has only {dataset_size} samples, recommend at least 100")
             
             self.logger.info(f"Dataset ready with {dataset_size} samples")
@@ -1498,7 +1619,7 @@ class PreparationValidator:
         return "\n".join(report_lines)
 
 
-def run_phase2(project_dir: Path,
+def run_phase2(project_dir: Union[Path, str],
                model_id: str = "zai-org/GLM-4.5-Air",
                quantization_method: QuantizationMethod = QuantizationMethod.AWQ,
                num_calibration_samples: int = 512) -> Dict[str, Any]:
@@ -1506,7 +1627,7 @@ def run_phase2(project_dir: Path,
     Execute Phase 2: Preparation.
     
     Args:
-        project_dir: Project directory
+        project_dir: Project directory (Path or string)
         model_id: HuggingFace model ID
         quantization_method: Method to use (AWQ or GPTQ)
         num_calibration_samples: Number of calibration samples
@@ -1514,6 +1635,9 @@ def run_phase2(project_dir: Path,
     Returns:
         Dictionary with phase results and paths
     """
+    # Ensure project_dir is a Path object
+    project_dir = Path(project_dir)
+    
     logger = logging.getLogger(__name__)
     logger.info("="*60)
     logger.info("PHASE 2: PREPARATION STARTED")
@@ -1563,12 +1687,20 @@ def run_phase2(project_dir: Path,
             results['errors'].extend(issues)
             logger.error(f"Recipe validation failed: {issues}")
         else:
-            recipe_path = recipe_manager.save_recipe(
-                recipe, 
-                f"glm_4_5_air_{quantization_method.value}"
-            )
-            results['recipe_path'] = recipe_path
-            logger.info(f"Recipe saved to {recipe_path}")
+            try:
+                recipe_path = recipe_manager.save_recipe(
+                    recipe, 
+                    f"glm_4_5_air_{quantization_method.value}"
+                )
+                if recipe_path and recipe_path.exists():
+                    results['recipe_path'] = recipe_path
+                    logger.info(f"Recipe saved to {recipe_path}")
+                else:
+                    results['errors'].append("Recipe save failed - path does not exist")
+                    logger.error("Recipe save failed - path does not exist")
+            except Exception as e:
+                results['errors'].append(f"Recipe save failed: {str(e)}")
+                logger.error(f"Recipe save failed: {e}")
         
         # Step 2: Prepare Dataset
         logger.info("Preparing calibration dataset...")
@@ -1653,13 +1785,22 @@ def run_phase2(project_dir: Path,
         # Step 5: Validation
         validator = PreparationValidator()
         
-        # Validate all components
-        recipe_ready = validator.validate_recipe_ready(results.get('recipe_path'))
+        # Validate all components with safe path handling
+        recipe_ready = False
+        if results.get('recipe_path'):
+            # Ensure it's a Path object
+            recipe_path = results['recipe_path'] if isinstance(results['recipe_path'], Path) else Path(results['recipe_path'])
+            recipe_ready = validator.validate_recipe_ready(recipe_path)
+        else:
+            recipe_ready = validator.validate_recipe_ready(None)
+        
         dataset_ready = validator.validate_dataset_ready(results.get('dataset'))
         model_ready = False
         
         if results.get('model_path'):
-            model_ready = validator.validate_model_ready(results['model_path'])
+            # Ensure it's a Path object
+            model_path = results['model_path'] if isinstance(results['model_path'], Path) else Path(results['model_path'])
+            model_ready = validator.validate_model_ready(model_path)
         
         # Generate report
         report = validator.generate_preparation_report(
@@ -1699,7 +1840,6 @@ def run_phase2(project_dir: Path,
     logger.info("="*60)
     
     return results
-
 
 if __name__ == "__main__":
     # Example standalone execution
